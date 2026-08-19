@@ -15,6 +15,7 @@
 
 require('dotenv').config();
 const http = require('http');
+const https = require('https');
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 const fs = require('fs');
@@ -43,6 +44,10 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
 // boʻlmagani uchun bu yerda RAQAMLI ID ishlatiladi (masalan: -1001234567890).
 // Bot bu kanalda ADMIN boʻlishi SHART, aks holda aʼzolikni tekshira olmaydi.
 const COURSE_CHANNEL_ID = process.env.COURSE_CHANNEL_ID || '';
+// Serverning oʻz ochiq (public) manzili — "uxlab qolmaslik" uchun oʻz-oʻziga
+// signal (ping) yuborishda ishlatiladi. Render avtomatik RENDER_EXTERNAL_URL
+// beradi, boʻlmasa WEBHOOK_URL ishlatiladi.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || WEBHOOK_URL || '';
 
 if (!BOT_TOKEN) {
   console.error('XATO: .env faylida BOT_TOKEN topilmadi.');
@@ -233,6 +238,37 @@ function wrapCustomEmoji(botInstance) {
   return botInstance;
 }
 
+// ---------- UXLAB QOLMASLIK (KEEP-ALIVE) ----------
+// Render kabi bepul hostinglar HTTP soʻrov kelmasa serverni "uxlatib qoʻyadi".
+// Shuni oldini olish uchun serverning oʻz ochiq (public) manziliga vaqti-vaqti
+// bilan oddiy GET soʻrov yuboramiz — bu tashqi trafik sifatida hisoblanib,
+// uyqu taymerini qayta boshidan ishga tushiradi.
+function pingSelf() {
+  if (!SELF_URL) return;
+  try {
+    const client = SELF_URL.startsWith('https') ? https : http;
+    const req = client.get(SELF_URL, (res) => {
+      res.resume(); // javobni tashlab yuboramiz, bizga faqat soʻrov yetib borgani kerak
+    });
+    req.on('error', (err) => {
+      console.error('pingSelf xatosi:', err.message);
+    });
+    req.setTimeout(10000, () => req.destroy());
+  } catch (err) {
+    console.error('pingSelf xatosi:', err.message);
+  }
+}
+
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000; // har 10 daqiqada (Render ~15 daqiqada uxlatadi)
+function startKeepAliveScheduler() {
+  if (!SELF_URL) {
+    console.log('Diqqat: SELF_URL (RENDER_EXTERNAL_URL/WEBHOOK_URL) sozlanmagan, keep-alive oʻchirilgan.');
+    return;
+  }
+  setInterval(pingSelf, KEEP_ALIVE_INTERVAL_MS);
+  console.log(`Keep-alive ishga tushdi: har ${KEEP_ALIVE_INTERVAL_MS / 60000} daqiqada ${SELF_URL} ga ping yuboriladi.`);
+}
+
 // ---------- BOT ----------
 let bot;
 async function startBot() {
@@ -268,6 +304,7 @@ async function startBot() {
 
   registerHandlers();
   startReminderScheduler();
+  startKeepAliveScheduler();
   console.log('Nazoratchi bot ishga tushdi.');
 }
 
@@ -553,6 +590,10 @@ function registerHandlers() {
   bot.onText(/^\/start$/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+
+    // Foydalanuvchi /start bosganda serverga darhol "signal" (ping) yuboramiz —
+    // bu Render'ning uyqu taymerini qayta boshidan ishga tushiradi.
+    pingSelf();
 
     // Avval kurs oʻtiladigan YOPIQ kanalga aʼzoligini tekshiramiz.
     // Bu yopiq kanal boʻlgani uchun "aʼzo boʻling" tugmasi koʻrsatilmaydi —
