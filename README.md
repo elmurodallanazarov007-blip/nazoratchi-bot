@@ -31,13 +31,29 @@ cp .env.example .env
 | `BOT_TOKEN` | @BotFather dan olinadigan token |
 | `MONGODB_URI` | Atlas’dan olingan connection string (yangi parol bilan) |
 | `MONGODB_DB_NAME` | Baza nomi (istalgan, masalan `nazoratchi`) |
-| `CHANNEL_ID` | Kurs kanali (`@username` yoki `-100...`) |
-| `CHANNEL_LINK` | Foydalanuvchiga koʻrsatiladigan link |
 | `ADMIN_IDS` | Admin(lar) Telegram `user_id` lari, vergul bilan |
 | `WEBHOOK_URL` | Boʻsh qoldirsangiz — polling. Toʻldirsangiz — webhook (Render uchun) |
 | `PORT` | Webhook rejimida ishlatiladigan port |
 
-**Muhim:** bot kanalga admin sifatida qoʻshilishi shart, aks holda aʼzolikni tekshira olmaydi (`getChatMember` metodi shu talab bilan ishlaydi).
+**Majburiy kanallar** `index.js` faylining yuqori qismida, `CHANNELS` massivida yoziladi:
+```js
+const CHANNELS = [
+  { id: '@talimtalaba', link: 'https://t.me/talimtalaba' },
+  { id: '@Matematika_milliysertifikatim', link: 'https://t.me/Matematika_milliysertifikatim' },
+];
+```
+Yangi kanal qoʻshish yoki oʻchirish uchun shu massivni tahrirlab, GitHub’ga qayta push qilsangiz yetarli — Render avtomatik qayta deploy qiladi. Environment Variables’da bu uchun hech narsa sozlash shart emas.
+
+**Muhim:** bot **har bir** majburiy kanalga admin sifatida qoʻshilishi shart, aks holda aʼzolikni tekshira olmaydi (`getChatMember` metodi shu talab bilan ishlaydi). Foydalanuvchi faqat **barcha** kanallarga aʼzo boʻlgandagina davom eta oladi; aʼzo boʻlmagan kanallar roʻyxati unga alohida-alohida koʻrsatiladi.
+
+### Kanallarni botni qayta deploy qilmasdan boshqarish (ixtiyoriy)
+Kod faylini oʻzgartirmasdan ham, bot ishlab turgan holatda admin sifatida shu buyruqlarni yuborib kanal qoʻshishingiz/oʻchirishingiz mumkin:
+```
+/addchannel @yangi_kanal https://t.me/yangi_kanal
+/removechannel @kanal_username
+/listchannels
+```
+Shu buyruqlardan foydalansangiz, keyingi safar bot qayta ishga tushganda ham (Render qayta deploy qilsa ham) siz admin buyruq bilan qoʻshgan kanallar saqlanib qoladi — chunki ular MongoDB’da saqlanadi, kod emas.
 
 Ishga tushirish:
 
@@ -67,7 +83,9 @@ Faqat `.env` dagi `ADMIN_IDS` roʻyxatidagilar uchun ishlaydi:
                                           masalan: /addtest TEST01|1-mavzu|A*B*C*D*A*B*C*D*A*B
 /toggletest KOD                       — testni faol/nofaol qilish
 /listtests                            — barcha testlar roʻyxati
-/setchannel @kanal https://t.me/kanal — kanalni sozlash (.env dan mustaqil, keyinchalik oʻzgartirish uchun)
+/addchannel @kanal https://t.me/kanal — majburiy kanal qoʻshish
+/removechannel @kanal                 — majburiy kanalni olib tashlash
+/listchannels                         — barcha majburiy kanallar roʻyxati
 /users                                — roʻyxatdan oʻtganlar soni va oxirgi 20 tasi
 /export                               — barcha natijalarni CSV (Excelda ochiladi) qilib yuklab olish
 /resetrating                          — reyting va barcha natijalarni tozalash
