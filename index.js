@@ -6,6 +6,7 @@
  */
 
 require('dotenv').config();
+const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 const fs = require('fs');
@@ -78,6 +79,19 @@ async function startBot() {
   } else {
     bot = new TelegramBot(BOT_TOKEN, { polling: true });
     console.log('Bot polling rejimida ishga tushdi.');
+
+    // Render "Web Service" turi HTTP portni tinglashni talab qiladi (health check uchun),
+    // aks holda deploy "abadiy kutish" holatida qotib qoladi. Polling rejimida
+    // node-telegram-bot-api hech qanday port ochmaydi, shuning uchun shu yerda
+    // eng oddiy HTTP server ochib qoʻyamiz — u faqat "OK" deb javob beradi.
+    http
+      .createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Nazoratchi bot ishlab turibdi.');
+      })
+      .listen(PORT, () => {
+        console.log(`Health-check server ${PORT}-portda ishga tushdi.`);
+      });
   }
 
   // Majburiy kanallar bazada topilmasa, index.js yuqorisidagi CHANNELS massividan olinadi.
