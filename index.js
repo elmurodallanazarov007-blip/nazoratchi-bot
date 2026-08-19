@@ -79,15 +79,114 @@ async function setSetting(key, value) {
   await Settings.updateOne({ key }, { $set: { value } }, { upsert: true });
 }
 
+// ---------- CUSTOM EMOJI ----------
+// Oddiy Unicode emoji -> Telegram Premium custom_emoji_id xaritasi.
+// Matnda shu emojilar uchrasa, avtomatik ravishda "custom_emoji" entity
+// sifatida yuboriladi (pastdagi wrapCustomEmoji() orqali).
+const CUSTOM_EMOJI_MAP = {
+  '✅': '5260463209562776385',
+  '❌': '5210952531676504517',
+  '⛔': '5260293700088511294',
+  '⚠️': '5447644880824181073',
+  '🎉': '5461151367559141950',
+  '⬅️': '5411112567609243032',
+  '➕': '5397916757333654639',
+  '➖': '5382261056078881010',
+  '🔟': '5429525083817255471',
+  '📊': '5231200819986047254',
+  '📢': '5321042567926652202',
+  '🏆': '5368617177635107810',
+  '📅': '5413879192267805083',
+  '🗓': '5472026645659401564',
+  '📝': '5814427657609153890',
+  '📱': '5407025283456835913',
+  '📋': '5352765106180610755',
+  '📡': '5413337163100083587',
+  '👥': '5264942233387285985',
+  '♻️': '5377584064326804458',
+  '🛠': '6332490126135920267',
+  '📘': '5388845245238622191',
+  '🔗': '5271604874419647061',
+  '📥': '5443127283898405358',
+  '🔹': '5980903978731310545',
+  '1️⃣': '5382322671679708881',
+  '2️⃣': '5381990043642502553',
+  '3️⃣': '5381879959335738545',
+  '4️⃣': '5382054253403577563',
+  '5️⃣': '5391197405553107640',
+  '6️⃣': '5390966190283694453',
+  '7️⃣': '5382132232829804982',
+  '8️⃣': '5391038994274329680',
+  '9️⃣': '5391234698754138414',
+};
+// Uzunroq (koʻp belgili, masalan variation selector qoʻshilgan) kalitlar
+// birinchi tekshirilishi uchun uzunlik boʻyicha kamayish tartibida saralanadi.
+const CUSTOM_EMOJI_KEYS = Object.keys(CUSTOM_EMOJI_MAP).sort((a, b) => b.length - a.length);
+
+// Matn ichidan bilingan emojilarni topib, Bot API "custom_emoji" entity
+// roʻyxatini quradi. offset/length UTF-16 kod birliklarida hisoblanadi —
+// JS stringlari aynan shu birliklarda indekslangani uchun to‘g‘ridan-to‘g‘ri mos keladi.
+function buildCustomEmojiEntities(text) {
+  const entities = [];
+  if (!text || typeof text !== 'string') return entities;
+  let i = 0;
+  while (i < text.length) {
+    let matched = false;
+    for (const key of CUSTOM_EMOJI_KEYS) {
+      if (text.startsWith(key, i)) {
+        entities.push({
+          type: 'custom_emoji',
+          offset: i,
+          length: key.length,
+          custom_emoji_id: CUSTOM_EMOJI_MAP[key],
+        });
+        i += key.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) i += 1;
+  }
+  return entities;
+}
+
+// bot.sendMessage / bot.editMessageText metodlarini "o'rab", matnda uchragan
+// oddiy emojilarni avtomatik custom_emoji entity bilan almashtiradi.
+// parse_mode ishlatilgan joylarda (bu botda hozircha yo'q) entities bilan
+// mos kelmasligi mumkin bo'lgani uchun bunday holatda tegilmaydi.
+function wrapCustomEmoji(botInstance) {
+  const originalSendMessage = botInstance.sendMessage.bind(botInstance);
+  botInstance.sendMessage = function (chatId, text, options = {}) {
+    if (!options.parse_mode && !options.entities) {
+      const entities = buildCustomEmojiEntities(text);
+      if (entities.length) options = { ...options, entities };
+    }
+    return originalSendMessage(chatId, text, options);
+  };
+
+  const originalEditMessageText = botInstance.editMessageText.bind(botInstance);
+  botInstance.editMessageText = function (text, options = {}) {
+    if (!options.parse_mode && !options.entities) {
+      const entities = buildCustomEmojiEntities(text);
+      if (entities.length) options = { ...options, entities };
+    }
+    return originalEditMessageText(text, options);
+  };
+
+  return botInstance;
+}
+
 // ---------- BOT ----------
 let bot;
 async function startBot() {
   if (WEBHOOK_URL) {
     bot = new TelegramBot(BOT_TOKEN, { webHook: { port: PORT } });
+    wrapCustomEmoji(bot);
     await bot.setWebHook(`${WEBHOOK_URL}/bot${BOT_TOKEN}`);
     console.log(`Bot webhook rejimida ishga tushdi: ${WEBHOOK_URL}/bot${BOT_TOKEN}`);
   } else {
     bot = new TelegramBot(BOT_TOKEN, { polling: true });
+    wrapCustomEmoji(bot);
     console.log('Bot polling rejimida ishga tushdi.');
 
     // Render "Web Service" turi HTTP portni tinglashni talab qiladi (health check uchun),
