@@ -167,7 +167,8 @@ function extractLeadingCustomEmoji(text) {
 
 // Bitta tugma obyektini (matnida boshida emoji bor boʻlsa) Bot API 9.4
 // formatiga oʻtkazadi: emoji matndan olib tashlanadi va icon_custom_emoji_id
-// sifatida qoʻyiladi. Boshqa maydonlar (callback_data, url va h.k.) tegilmaydi.
+// sifatida qoʻyiladi (aks holda emoji ikki marta — ham ikonka, ham matnda —
+// koʻrinib qolar edi). Boshqa maydonlar (callback_data, url va h.k.) tegilmaydi.
 function applyButtonIcon(btn) {
   if (!btn || typeof btn.text !== 'string' || btn.icon_custom_emoji_id) return btn;
   const found = extractLeadingCustomEmoji(btn.text);
@@ -177,6 +178,10 @@ function applyButtonIcon(btn) {
 
 // reply_markup ichidagi barcha qatorlar (inline_keyboard yoki keyboard)
 // boʻylab yurib, har bir tugmaga applyButtonIcon() ni qoʻllaydi.
+// DIQQAT: reply-klaviatura (pastdagi) tugmasi bosilganda AYNAN shu (yangi,
+// emojisiz) matn foydalanuvchi xabari sifatida botga qaytadi — shuning uchun
+// handlerlar ('📝 Vazifani yuborish' kabi) ham shu yangi matnga mos yozilgan
+// boʻlishi kerak (pastda tuzatildi).
 function applyReplyMarkupIcons(replyMarkup) {
   if (!replyMarkup) return replyMarkup;
   const rm = { ...replyMarkup };
@@ -567,14 +572,14 @@ function registerHandlers() {
 
     const session = getSession(chatId);
 
-    if (text === '📝 Vazifani yuborish') {
+    if (text === 'Vazifani yuborish') {
       return handleAskForTestCode(chatId, userId);
     }
-    if (text === '📊 Mening natijalarim') {
+    if (text === 'Mening natijalarim') {
       resetSession(chatId);
       return handleMyResults(chatId, userId);
     }
-    if (text === '🏆 Reyting') {
+    if (text === 'Reyting') {
       resetSession(chatId);
       return handleRating(chatId, userId, 0, 'all');
     }
