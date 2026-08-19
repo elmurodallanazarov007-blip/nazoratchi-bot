@@ -127,6 +127,7 @@ const CUSTOM_EMOJI_MAP = {
   '7️⃣': '5382132232829804982',
   '8️⃣': '5391038994274329680',
   '9️⃣': '5391234698754138414',
+  '👇': '5771449161123631882',
 };
 // Uzunroq (koʻp belgili, masalan variation selector qoʻshilgan) kalitlar
 // birinchi tekshirilishi uchun uzunlik boʻyicha kamayish tartibida saralanadi.
@@ -430,6 +431,28 @@ async function isCourseChannelMember(userId) {
   }
 }
 
+function notInCourseMessage() {
+  return "Siz hali kursga qoʻshilmagansiz\nqoʻshilish uchun pastdagi tugma orqali roʻyxatdan oʻting 👇";
+}
+
+// Kursga qoʻshilish uchun shaffof URL-tugma (Bot API 9.4 style: rangli + custom emoji ikonka).
+function notInCourseKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: 'Kursga qoʻshilish',
+            url: 'https://t.me/ms_asilbekbot',
+            style: 'success',
+            icon_custom_emoji_id: '5282843764451195532',
+          },
+        ],
+      ],
+    },
+  };
+}
+
 function notMemberMessage(missing) {
   return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling, keyin "✅ Tekshirish" tugmasini bosing:`;
 }
@@ -600,7 +623,7 @@ function registerHandlers() {
     // foydalanuvchi shu kanalga administrator tomonidan qoʻshilgan boʻlishi kerak.
     const inCourseChannel = await isCourseChannelMember(userId);
     if (!inCourseChannel) {
-      return bot.sendMessage(chatId, '❌ Siz kursga roʻyxatdan oʻtmagansiz.');
+      return bot.sendMessage(chatId, notInCourseMessage(), notInCourseKeyboard());
     }
 
     const membership = await checkMembership(userId);
