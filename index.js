@@ -11,6 +11,14 @@ const { MongoClient } = require('mongodb');
 const fs = require('fs');
 const path = require('path');
 
+// ---------- MAJBURIY KANALLAR ----------
+// Shu yerga xohlagancha kanal qo'shishingiz yoki o'chirishingiz mumkin.
+// Bot HAR BIR shu kanalda ADMIN bo'lishi shart, aks holda a'zolikni tekshira olmaydi.
+const CHANNELS = [
+  { id: '@talimtalaba', link: 'https://t.me/talimtalaba' },
+  { id: '@Matematika_milliysertifikatim', link: 'https://t.me/Matematika_milliysertifikatim' },
+];
+
 // ---------- ENV ----------
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -72,13 +80,10 @@ async function startBot() {
     console.log('Bot polling rejimida ishga tushdi.');
   }
 
-  const envChannelId = await getSetting('channel_id', null);
-  if (!envChannelId && process.env.CHANNEL_ID) {
-    await setSetting('channel_id', process.env.CHANNEL_ID);
-  }
-  const envChannelLink = await getSetting('channel_link', null);
-  if (!envChannelLink && process.env.CHANNEL_LINK) {
-    await setSetting('channel_link', process.env.CHANNEL_LINK);
+  // Majburiy kanallar bazada topilmasa, index.js yuqorisidagi CHANNELS massividan olinadi.
+  const existingChannels = await getSetting('channels', null);
+  if (!existingChannels) {
+    await setSetting('channels', JSON.stringify(CHANNELS));
   }
 
   registerHandlers();
@@ -132,21 +137,43 @@ async function getUser(userId) {
   return Users.findOne({ user_id: userId });
 }
 
-async function checkMembership(userId) {
-  const channelId = await getSetting('channel_id', null);
-  if (!channelId) return true; // kanal sozlanmagan boʻlsa, tekshiruv oʻtkazib yuboriladi
+async function getChannels() {
+  const raw = await getSetting('channels', null);
+  if (!raw) return [];
   try {
-    const member = await bot.getChatMember(channelId, userId);
-    return ['creator', 'administrator', 'member'].includes(member.status);
-  } catch (err) {
-    console.error('getChatMember xatosi:', err.message);
-    return false;
+    return JSON.parse(raw);
+  } catch (e) {
+    return [];
   }
 }
+async function saveChannels(channels) {
+  await setSetting('channels', JSON.stringify(channels));
+}
 
-async function notMemberMessage() {
-  const link = await getSetting('channel_link', '#');
-  return `❌ Siz kursga roʻyxatdan oʻtmagansiz.\nRoʻyxatdan oʻtish uchun kursga aʼzo boʻling: ${link}\n\nAʼzo boʻlgach, qaytadan /start bosing.`;
+// Barcha sozlangan kanallarni tekshiradi. Foydalanuvchi hali aʼzo boʻlmagan
+// kanallar roʻyxatini qaytaradi (boʻsh roʻyxat = hammasiga aʼzo).
+async function checkMembership(userId) {
+  const channels = await getChannels();
+  if (channels.length === 0) return { ok: true, missing: [] };
+
+  const missing = [];
+  for (const ch of channels) {
+    try {
+      const member = await bot.getChatMember(ch.id, userId);
+      if (!['creator', 'administrator', 'member'].includes(member.status)) {
+        missing.push(ch);
+      }
+    } catch (err) {
+      console.error(`getChatMember xatosi (${ch.id}):`, err.message);
+      missing.push(ch);
+    }
+  }
+  return { ok: missing.length === 0, missing };
+}
+
+function notMemberMessage(missing) {
+  const lines = missing.map((ch) => `🔗 ${ch.link}`).join('\n');
+  return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling:\n\n${lines}\n\nAʼzo boʻlgach, qaytadan /start bosing.`;
 }
 
 function normalizeAnswers(raw) {
@@ -225,9 +252,9 @@ function registerHandlers() {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
 
-    const member = await checkMembership(userId);
-    if (!member) {
-      return bot.sendMessage(chatId, await notMemberMessage());
+    const membership = await checkMembership(userId);
+    if (!membership.ok) {
+      return bot.sendMessage(chatId, notMemberMessage(membership.missing));
     }
 
     const user = await getUser(userId);
@@ -314,10 +341,10 @@ function registerHandlers() {
       case STATES.TEST_ANSWERS: {
         if (!text) return bot.sendMessage(chatId, 'Iltimos, javoblarni matn koʻrinishida yuboring.');
 
-        const member = await checkMembership(userId);
-        if (!member) {
+        const membership = await checkMembership(userId);
+        if (!membership.ok) {
           resetSession(chatId);
-          return bot.sendMessage(chatId, await notMemberMessage());
+          return bot.sendMessage(chatId, notMemberMessage(membership.missing));
         }
 
         const test = await Tests.findOne({ test_code: session.data.test_code });
@@ -454,12 +481,42 @@ function registerHandlers() {
     bot.sendMessage(msg.chat.id, text);
   });
 
-  // /setchannel @kanal_username https://t.me/kanal
-  bot.onText(/^\/setchannel (\S+)\s+(\S+)/, async (msg, match) => {
+  // /addchannel @kanal_username https://t.me/kanal — yangi majburiy kanal qoʻshadi
+  bot.onText(/^\/addchannel (\S+)\s+(\S+)/, async (msg, match) => {
     if (!requireAdmin(msg)) return;
-    await setSetting('channel_id', match[1]);
-    await setSetting('channel_link', match[2]);
-    bot.sendMessage(msg.chat.id, `✅ Kanal sozlandi:\nID: ${match[1]}\nLink: ${match[2]}`);
+    const id = match[1];
+    const link = match[2];
+    const channels = await getChannels();
+    if (channels.some((c) => c.id === id)) {
+      return bot.sendMessage(msg.chat.id, `ℹ️ ${id} allaqachon roʻyxatda bor.`);
+    }
+    channels.push({ id, link });
+    await saveChannels(channels);
+    bot.sendMessage(msg.chat.id, `✅ Kanal qoʻshildi: ${id}\nJami majburiy kanallar: ${channels.length}`);
+  });
+
+  // /removechannel @kanal_username — kanalni majburiy roʻyxatdan olib tashlaydi
+  bot.onText(/^\/removechannel (\S+)/, async (msg, match) => {
+    if (!requireAdmin(msg)) return;
+    const id = match[1];
+    const channels = await getChannels();
+    const filtered = channels.filter((c) => c.id !== id);
+    if (filtered.length === channels.length) {
+      return bot.sendMessage(msg.chat.id, `❌ ${id} roʻyxatda topilmadi.`);
+    }
+    await saveChannels(filtered);
+    bot.sendMessage(msg.chat.id, `✅ Kanal olib tashlandi: ${id}\nJami majburiy kanallar: ${filtered.length}`);
+  });
+
+  // /listchannels — barcha majburiy kanallarni koʻrsatadi
+  bot.onText(/^\/listchannels$/, async (msg) => {
+    if (!requireAdmin(msg)) return;
+    const channels = await getChannels();
+    if (channels.length === 0) {
+      return bot.sendMessage(msg.chat.id, 'Hozircha majburiy kanal sozlanmagan (aʼzolik tekshirilmaydi).');
+    }
+    const text = channels.map((c, i) => `${i + 1}. ${c.id} — ${c.link}`).join('\n');
+    bot.sendMessage(msg.chat.id, `Majburiy kanallar (${channels.length}):\n${text}`);
   });
 
   // /users - roʻyxatdan oʻtganlar soni va oxirgi 20 tasi
@@ -534,7 +591,9 @@ function registerHandlers() {
         '/addtest KOD|Nomi|JAVOBLAR — test qoʻshish/tahrirlash',
         '/toggletest KOD — testni faol/nofaol qilish',
         '/listtests — barcha testlar',
-        '/setchannel @kanal https://t.me/kanal — kanalni sozlash',
+        '/addchannel @kanal https://t.me/kanal — majburiy kanal qoʻshish',
+        '/removechannel @kanal — majburiy kanalni olib tashlash',
+        '/listchannels — barcha majburiy kanallar roʻyxati',
         '/users — roʻyxatdan oʻtganlar',
         '/export — natijalarni CSV qilib yuklab olish',
         '/resetrating — reytingni tozalash',
@@ -545,10 +604,10 @@ function registerHandlers() {
 }
 
 async function handleAskForTestCode(chatId, userId) {
-  const member = await checkMembership(userId);
-  if (!member) {
+  const membership = await checkMembership(userId);
+  if (!membership.ok) {
     resetSession(chatId);
-    return bot.sendMessage(chatId, await notMemberMessage());
+    return bot.sendMessage(chatId, notMemberMessage(membership.missing));
   }
   const user = await getUser(userId);
   if (!user) {
