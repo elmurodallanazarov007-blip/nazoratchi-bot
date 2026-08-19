@@ -39,6 +39,10 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '')
   .map((s) => s.trim())
   .filter(Boolean)
   .map(Number);
+// Kurs oʻtiladigan YOPIQ (private) kanal IDsi. Yopiq kanallarda @username
+// boʻlmagani uchun bu yerda RAQAMLI ID ishlatiladi (masalan: -1001234567890).
+// Bot bu kanalda ADMIN boʻlishi SHART, aks holda aʼzolikni tekshira olmaydi.
+const COURSE_CHANNEL_ID = process.env.COURSE_CHANNEL_ID || '';
 
 if (!BOT_TOKEN) {
   console.error('XATO: .env faylida BOT_TOKEN topilmadi.');
@@ -375,6 +379,20 @@ async function checkMembership(userId) {
   return { ok: missing.length === 0, missing };
 }
 
+// Foydalanuvchi kurs oʻtiladigan YOPIQ kanalga aʼzo-aʼzo emasligini tekshiradi.
+// COURSE_CHANNEL_ID sozlanmagan boʻlsa, tekshiruv oʻtkazib yuboriladi (true qaytadi) —
+// bu holatda /start ilgarigidek ochiq kanallar (CHANNELS) boʻyicha ishlayveradi.
+async function isCourseChannelMember(userId) {
+  if (!COURSE_CHANNEL_ID) return true;
+  try {
+    const member = await bot.getChatMember(COURSE_CHANNEL_ID, userId);
+    return ['creator', 'administrator', 'member'].includes(member.status);
+  } catch (err) {
+    console.error('Kurs kanali aʼzoligini tekshirishda xato:', err.message);
+    return false;
+  }
+}
+
 function notMemberMessage(missing) {
   return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling, keyin "✅ Tekshirish" tugmasini bosing:`;
 }
@@ -535,6 +553,14 @@ function registerHandlers() {
   bot.onText(/^\/start$/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+
+    // Avval kurs oʻtiladigan YOPIQ kanalga aʼzoligini tekshiramiz.
+    // Bu yopiq kanal boʻlgani uchun "aʼzo boʻling" tugmasi koʻrsatilmaydi —
+    // foydalanuvchi shu kanalga administrator tomonidan qoʻshilgan boʻlishi kerak.
+    const inCourseChannel = await isCourseChannelMember(userId);
+    if (!inCourseChannel) {
+      return bot.sendMessage(chatId, '❌ Siz kursga roʻyxatdan oʻtmagansiz.');
+    }
 
     const membership = await checkMembership(userId);
     if (!membership.ok) {
