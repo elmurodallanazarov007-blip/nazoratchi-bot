@@ -1,0 +1,19 @@
+{
+  "name": "nazoratchi-bot",
+  "version": "1.0.0",
+  "description": "Kurs ishtirokchilarini nazorat qiluvchi Telegram bot (roʻyxatdan oʻtish, test topshirish, reyting)",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "mongodb": "^6.9.0",
+    "dotenv": "^16.4.5"
+  },
+  "license": "MIT"
+}
