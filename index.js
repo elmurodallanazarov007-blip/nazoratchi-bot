@@ -150,25 +150,73 @@ function buildCustomEmojiEntities(text) {
   return entities;
 }
 
-// bot.sendMessage / bot.editMessageText metodlarini "o'rab", matnda uchragan
-// oddiy emojilarni avtomatik custom_emoji entity bilan almashtiradi.
-// parse_mode ishlatilgan joylarda (bu botda hozircha yo'q) entities bilan
-// mos kelmasligi mumkin bo'lgani uchun bunday holatda tegilmaydi.
+// Tugma matni boshida bilingan emoji boʻlsa, uni matndan ajratib
+// { id, text } qaytaradi (masalan "🏆 Reyting" -> { id: '536...810', text: 'Reyting' }).
+// Topilmasa null qaytaradi.
+function extractLeadingCustomEmoji(text) {
+  if (!text || typeof text !== 'string') return null;
+  for (const key of CUSTOM_EMOJI_KEYS) {
+    if (text.startsWith(key)) {
+      let rest = text.slice(key.length);
+      if (rest.startsWith(' ')) rest = rest.slice(1);
+      return { id: CUSTOM_EMOJI_MAP[key], text: rest };
+    }
+  }
+  return null;
+}
+
+// Bitta tugma obyektini (matnida boshida emoji bor boʻlsa) Bot API 9.4
+// formatiga oʻtkazadi: emoji matndan olib tashlanadi va icon_custom_emoji_id
+// sifatida qoʻyiladi. Boshqa maydonlar (callback_data, url va h.k.) tegilmaydi.
+function applyButtonIcon(btn) {
+  if (!btn || typeof btn.text !== 'string' || btn.icon_custom_emoji_id) return btn;
+  const found = extractLeadingCustomEmoji(btn.text);
+  if (!found) return btn;
+  return { ...btn, text: found.text, icon_custom_emoji_id: found.id };
+}
+
+// reply_markup ichidagi barcha qatorlar (inline_keyboard yoki keyboard)
+// boʻylab yurib, har bir tugmaga applyButtonIcon() ni qoʻllaydi.
+function applyReplyMarkupIcons(replyMarkup) {
+  if (!replyMarkup) return replyMarkup;
+  const rm = { ...replyMarkup };
+  if (Array.isArray(rm.inline_keyboard)) {
+    rm.inline_keyboard = rm.inline_keyboard.map((row) => row.map(applyButtonIcon));
+  }
+  if (Array.isArray(rm.keyboard)) {
+    rm.keyboard = rm.keyboard.map((row) => row.map(applyButtonIcon));
+  }
+  return rm;
+}
+
+// bot.sendMessage / bot.editMessageText metodlarini "o'rab":
+// 1) Xabar matnidagi bilingan emojilarni custom_emoji entity bilan almashtiradi.
+// 2) Klaviatura tugmalaridagi bilingan emojilarni Bot API 9.4 icon_custom_emoji_id
+//    ga aylantiradi (parse_mode ishlatilgan joylarda — bu botda hozircha yo'q —
+//    entities bilan mos kelmasligi mumkin boʻlgani uchun bunday holatda tegilmaydi).
 function wrapCustomEmoji(botInstance) {
   const originalSendMessage = botInstance.sendMessage.bind(botInstance);
   botInstance.sendMessage = function (chatId, text, options = {}) {
+    options = { ...options };
     if (!options.parse_mode && !options.entities) {
       const entities = buildCustomEmojiEntities(text);
-      if (entities.length) options = { ...options, entities };
+      if (entities.length) options.entities = entities;
+    }
+    if (options.reply_markup) {
+      options.reply_markup = applyReplyMarkupIcons(options.reply_markup);
     }
     return originalSendMessage(chatId, text, options);
   };
 
   const originalEditMessageText = botInstance.editMessageText.bind(botInstance);
   botInstance.editMessageText = function (text, options = {}) {
+    options = { ...options };
     if (!options.parse_mode && !options.entities) {
       const entities = buildCustomEmojiEntities(text);
-      if (entities.length) options = { ...options, entities };
+      if (entities.length) options.entities = entities;
+    }
+    if (options.reply_markup) {
+      options.reply_markup = applyReplyMarkupIcons(options.reply_markup);
     }
     return originalEditMessageText(text, options);
   };
@@ -1404,7 +1452,7 @@ async function buildRatingText(page, userId, period) {
 
 function ratingKeyboard(page, totalPages, period) {
   const periodRow = Object.keys(RATING_PERIODS).map((key) => ({
-    text: (key === period ? '✅ ' : '') + RATING_PERIODS[key].label,
+    text: RATING_PERIODS[key].label,
     callback_data: `rating_${key}_0`,
     style: key === period ? 'success' : 'primary',
   }));
