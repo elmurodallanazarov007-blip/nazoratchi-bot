@@ -443,7 +443,7 @@ function notInCourseKeyboard() {
         [
           {
             text: 'Kursga qoʻshilish',
-            url: 'https://t.me/ms_asilbekbot',
+            url: 'https://t.me/ms_turbo_1/7',
             style: 'success',
             icon_custom_emoji_id: '5282843764451195532',
           },
