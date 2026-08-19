@@ -1,4 +1,4 @@
-# Nazoratchi Bot
+# Nazoratchi Bot 
 
 Kurs ishtirokchilarini nazorat qiluvchi Telegram bot: kanalga aʼzolikni tekshiradi, roʻyxatdan oʻtkazadi, testlarni "kalit" orqali qabul qiladi, natijalarni hisoblaydi va reyting koʻrsatadi.
 
