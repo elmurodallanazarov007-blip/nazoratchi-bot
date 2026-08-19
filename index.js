@@ -3,6 +3,14 @@
  * Kurs ishtirokchilarini nazorat qiluvchi Telegram bot.
  * Kutubxona: node-telegram-bot-api (telegraf EMAS)
  * Baza: MongoDB Atlas (mongodb rasmiy driver)
+ *
+ * v2 (zamonaviylashtirilgan):
+ * - Inline tugmali admin panel (/admin)
+ * - Test uchun vaqt chegarasi (timer) va muddat (deadline)
+ * - Muddat tugashi oldidan avtomatik eslatma
+ * - Umumiy / Haftalik / Oylik reyting
+ * - Statistika: eng ko'p xato qilingan savollar
+ * - Barcha tugmalar rangli (Bot API 9.4 style: primary/success/danger)
  */
 
 require('dotenv').config();
@@ -56,6 +64,8 @@ async function initDb() {
   await Users.createIndex({ user_id: 1 }, { unique: true });
   await Tests.createIndex({ test_code: 1 }, { unique: true });
   await Submissions.createIndex({ user_id: 1, test_code: 1 }, { unique: true });
+  await Submissions.createIndex({ test_code: 1 });
+  await Submissions.createIndex({ submitted_at: 1 });
   await Settings.createIndex({ key: 1 }, { unique: true });
 
   console.log('✅ MongoDB’ga ulanish oʻrnatildi.');
@@ -101,6 +111,7 @@ async function startBot() {
   }
 
   registerHandlers();
+  startReminderScheduler();
   console.log('Nazoratchi bot ishga tushdi.');
 }
 
@@ -120,7 +131,31 @@ function getSession(chatId) {
   return sessions.get(chatId);
 }
 function resetSession(chatId) {
+  const existing = sessions.get(chatId);
+  if (existing && existing.data && existing.data.timer) {
+    clearTimeout(existing.data.timer);
+  }
   sessions.set(chatId, { state: STATES.IDLE, data: {} });
+}
+
+// Admin uchun alohida holat mashinasi — foydalanuvchi FSM'siga aralashmasligi uchun.
+const adminSessions = new Map();
+const ADMIN_STATES = {
+  IDLE: 'idle',
+  ADD_CODE: 'add_code',
+  ADD_TITLE: 'add_title',
+  ADD_KEY: 'add_key',
+  ADD_DURATION: 'add_duration',
+  ADD_DEADLINE: 'add_deadline',
+  ADD_CHANNEL: 'add_channel',
+  BROADCAST: 'broadcast',
+};
+function getAdminSession(chatId) {
+  if (!adminSessions.has(chatId)) adminSessions.set(chatId, { state: ADMIN_STATES.IDLE, data: {} });
+  return adminSessions.get(chatId);
+}
+function resetAdminSession(chatId) {
+  adminSessions.set(chatId, { state: ADMIN_STATES.IDLE, data: {} });
 }
 
 // ---------- KEYBOARDS ----------
@@ -192,8 +227,7 @@ function notMemberMessage(missing) {
   return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling, keyin "✅ Tekshirish" tugmasini bosing:`;
 }
 
-// Har bir kanal uchun shaffof (style berilmagan — Bot API 9.4'da inline tugmalar uchun
-// standart koʻrinish shaffof boʻladi) URL-tugma, pastda esa koʻk (primary) "Tekshirish" tugmasi.
+// Har bir kanal uchun shaffof URL-tugma, pastda esa yashil "Tekshirish" tugmasi (Bot API 9.4 style).
 function notMemberKeyboard(missing) {
   const rows = missing.map((ch) => [
     { text: `🔗 ${ch.id.replace('@', '')}`, url: ch.link, style: 'primary' },
@@ -231,9 +265,32 @@ function scoreAnswers(userAnswers, keyAnswers) {
   return correct;
 }
 
+function formatDateTime(d) {
+  if (!d) return '—';
+  const date = new Date(d);
+  return date.toLocaleString('uz-UZ', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+// "YYYY-MM-DD HH:MM" formatini Date obyektiga aylantiradi. Notoʻgʻri boʻlsa null.
+function parseDeadlineInput(text) {
+  const t = text.trim();
+  if (t === '0' || t.toLowerCase() === "yo'q" || t.toLowerCase() === 'yoq') return { skip: true };
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  if (!m) return { skip: false, valid: false };
+  const [, y, mo, da, h, mi] = m;
+  const date = new Date(Number(y), Number(mo) - 1, Number(da), Number(h), Number(mi));
+  if (isNaN(date.getTime())) return { skip: false, valid: false };
+  return { skip: false, valid: true, date };
+}
+
 // Bitta test kodini qayta topshirish siyosati:
-// "BEST" - eng yaxshi natija saqlanadi (standart)
-// "LAST" (har doim oxirgisi) yoki "FIRST" (faqat birinchisi) ga oʻzgartirish mumkin.
+// "BEST" - eng yaxshi natija saqlanadi (standart), "LAST" - oxirgisi, "FIRST" - faqat birinchisi.
 const RESUBMIT_POLICY = 'BEST';
 
 async function saveSubmission(userId, testCode, userAnswersRaw, correctCount, percentage) {
@@ -272,6 +329,55 @@ async function saveSubmission(userId, testCode, userAnswersRaw, correctCount, pe
   return { saved: false, correctCount: existing.correct_count, percentage: existing.percentage };
 }
 
+// Testni yaratadi yoki yangilaydi (legacy /addtest buyrug'i va admin panel ikkalasi ham shundan foydalanadi).
+async function upsertTest(testCode, title, keyRaw, durationMinutes, deadlineDate) {
+  const key = normalizeAnswers(keyRaw);
+  if (key.length === 0) return { ok: false, reason: 'empty_key' };
+  const code = testCode.toUpperCase();
+  await Tests.updateOne(
+    { test_code: code },
+    {
+      $set: {
+        test_code: code,
+        title,
+        answer_key: key.join('*'),
+        questions_count: key.length,
+        is_active: true,
+        duration_minutes: durationMinutes || null,
+        deadline: deadlineDate || null,
+        reminder_sent: false,
+      },
+      $setOnInsert: { created_at: new Date() },
+    },
+    { upsert: true }
+  );
+  return { ok: true, code, questionsCount: key.length };
+}
+
+// Test uchun har bir savol boʻyicha xato foizini hisoblaydi.
+async function computeQuestionStats(testCode) {
+  const test = await Tests.findOne({ test_code: testCode });
+  if (!test) return null;
+  const key = normalizeAnswers(test.answer_key);
+  const subs = await Submissions.find({ test_code: testCode }).toArray();
+  const total = subs.length;
+  const wrongCounts = new Array(key.length).fill(0);
+  for (const s of subs) {
+    const ua = normalizeAnswers(s.user_answers);
+    for (let i = 0; i < key.length; i++) {
+      if (ua[i] !== key[i]) wrongCounts[i]++;
+    }
+  }
+  const stats = wrongCounts.map((w, i) => ({
+    q: i + 1,
+    wrong: w,
+    total,
+    rate: total ? Math.round((w / total) * 1000) / 10 : 0,
+  }));
+  stats.sort((a, b) => b.rate - a.rate);
+  return { test, total, stats };
+}
+
 function registerHandlers() {
   // ---------- /start ----------
   bot.onText(/^\/start$/, async (msg) => {
@@ -302,8 +408,17 @@ function registerHandlers() {
 
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const session = getSession(chatId);
     const text = msg.text ? msg.text.trim() : '';
+
+    // ---- Avval admin FSM holatini tekshiramiz ----
+    if (isAdmin(userId)) {
+      const aSession = getAdminSession(chatId);
+      if (aSession.state !== ADMIN_STATES.IDLE) {
+        return handleAdminFsmMessage(chatId, aSession, text);
+      }
+    }
+
+    const session = getSession(chatId);
 
     if (text === '📝 Vazifani yuborish') {
       return handleAskForTestCode(chatId, userId);
@@ -314,7 +429,7 @@ function registerHandlers() {
     }
     if (text === '🏆 Reyting') {
       resetSession(chatId);
-      return handleRating(chatId, userId, 0);
+      return handleRating(chatId, userId, 0, 'all');
     }
 
     switch (session.state) {
@@ -356,16 +471,46 @@ function registerHandlers() {
         if (!test) {
           return bot.sendMessage(chatId, '❌ Bunday test kodi topilmadi. Qaytadan urinib koʻring.');
         }
+        if (test.deadline && new Date() > new Date(test.deadline)) {
+          return bot.sendMessage(
+            chatId,
+            `⛔ "${test.title}" testini topshirish muddati tugagan (${formatDateTime(test.deadline)}).`
+          );
+        }
+
         session.data.test_code = test.test_code;
         session.state = STATES.TEST_ANSWERS;
-        return bot.sendMessage(
-          chatId,
-          `Javoblaringizni * belgisi bilan ajratib yuboring.\nMasalan: A*B*C*D*A*B*C*D*A*B*...\nJami ${test.questions_count} ta javob boʻlishi kerak.`
-        );
+
+        let infoLines = [
+          `Javoblaringizni * belgisi bilan ajratib yuboring.`,
+          `Masalan: A*B*C*D*A*B*C*D*A*B*...`,
+          `Jami ${test.questions_count} ta javob boʻlishi kerak.`,
+        ];
+
+        if (test.duration_minutes) {
+          const timeoutMs = test.duration_minutes * 60 * 1000;
+          session.data.deadline_ts = Date.now() + timeoutMs;
+          infoLines.push(`⏱ Sizda ${test.duration_minutes} daqiqa vaqt bor. Vaqt tugasa test avtomatik bekor boʻladi.`);
+
+          session.data.timer = setTimeout(() => {
+            const s = sessions.get(chatId);
+            if (s && s.state === STATES.TEST_ANSWERS && s.data.test_code === test.test_code) {
+              resetSession(chatId);
+              bot.sendMessage(chatId, `⏱ "${test.title}" uchun vaqt tugadi. Test bekor qilindi, qaytadan urinib koʻring.`, mainMenu);
+            }
+          }, timeoutMs);
+        }
+
+        return bot.sendMessage(chatId, infoLines.join('\n'));
       }
 
       case STATES.TEST_ANSWERS: {
         if (!text) return bot.sendMessage(chatId, 'Iltimos, javoblarni matn koʻrinishida yuboring.');
+
+        if (session.data.deadline_ts && Date.now() > session.data.deadline_ts) {
+          resetSession(chatId);
+          return bot.sendMessage(chatId, '⏱ Vaqt tugagan. Testni qaytadan boshlang.', mainMenu);
+        }
 
         const membership = await checkMembership(userId);
         if (!membership.ok) {
@@ -399,6 +544,8 @@ function registerHandlers() {
         const percentage = Math.round((correctCount / test.questions_count) * 1000) / 10;
 
         const result = await saveSubmission(userId, test.test_code, answers.join('*'), correctCount, percentage);
+
+        if (session.data.timer) clearTimeout(session.data.timer);
         resetSession(chatId);
 
         if (!result.saved) {
@@ -423,8 +570,10 @@ function registerHandlers() {
   bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
+    const data = query.data || '';
 
-    if (query.data === 'check_membership') {
+    // ---- A'zolikni tekshirish ----
+    if (data === 'check_membership') {
       const membership = await checkMembership(userId);
       if (membership.ok) {
         try {
@@ -442,31 +591,40 @@ function registerHandlers() {
           message_id: query.message.message_id,
           ...notMemberKeyboard(membership.missing),
         });
-      } catch (e) {
-        // xabar oʻzgarmagan boʻlishi mumkin (hali ham xuddi shu kanallarga aʼzo emas)
-      }
+      } catch (e) {}
       return bot.answerCallbackQuery(query.id, { text: '❌ Hali barcha kanallarga aʼzo emassiz.' });
     }
 
-    if (query.data && query.data.startsWith('rating_')) {
-      const page = parseInt(query.data.split('_')[1], 10) || 0;
-      const { text, totalPages } = await buildRatingText(page, userId);
+    // ---- Reyting: davr almashtirish / sahifalash (rating_<period>_<page>) ----
+    if (data.startsWith('rating_')) {
+      const parts = data.split('_');
+      const period = parts[1];
+      const page = parseInt(parts[2], 10) || 0;
+      const { text, totalPages } = await buildRatingText(page, userId, period);
       try {
         await bot.editMessageText(text, {
           chat_id: chatId,
           message_id: query.message.message_id,
-          ...ratingKeyboard(page, totalPages),
+          ...ratingKeyboard(page, totalPages, period),
         });
-      } catch (e) {
-        // xabar oʻzgarmagan boʻlishi mumkin, xato eʼtiborsiz qoldiriladi
-      }
+      } catch (e) {}
       return bot.answerCallbackQuery(query.id);
     }
+
+    // ---- Admin panel tugmalari ----
+    if (data.startsWith('admin_')) {
+      if (!isAdmin(userId)) {
+        return bot.answerCallbackQuery(query.id, { text: '⛔ Bu sizga tegishli emas.' });
+      }
+      await handleAdminCallback(chatId, query, data);
+      return;
+    }
+
     return bot.answerCallbackQuery(query.id);
   });
 
   // =====================================================================
-  // ADMIN BUYRUQLARI
+  // ADMIN: INLINE PANEL
   // =====================================================================
 
   function requireAdmin(msg) {
@@ -477,37 +635,429 @@ function registerHandlers() {
     return true;
   }
 
-  // /addtest TEST01|12-mavzu testi|ABCDABCDAB...
+  function adminMainKeyboard() {
+    return {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '➕ Test qoʻshish', callback_data: 'admin_addtest', style: 'primary' },
+            { text: '📋 Testlar', callback_data: 'admin_listtests', style: 'primary' },
+          ],
+          [
+            { text: '📡 Kanallar', callback_data: 'admin_channels', style: 'primary' },
+            { text: '👥 Foydalanuvchilar', callback_data: 'admin_users', style: 'primary' },
+          ],
+          [
+            { text: '📊 Statistika', callback_data: 'admin_stats', style: 'primary' },
+            { text: '📢 Xabar yuborish', callback_data: 'admin_broadcast', style: 'primary' },
+          ],
+          [
+            { text: '📥 Export CSV', callback_data: 'admin_export', style: 'success' },
+            { text: '♻️ Reytingni tozalash', callback_data: 'admin_resetrating', style: 'danger' },
+          ],
+        ],
+      },
+    };
+  }
+
+  // /admin — inline panelni ochadi
+  bot.onText(/^\/admin$/, (msg) => {
+    if (!requireAdmin(msg)) return;
+    resetAdminSession(msg.chat.id);
+    bot.sendMessage(msg.chat.id, '🛠 Admin panel:', adminMainKeyboard());
+  });
+
+  async function backToAdminMenu(chatId, messageId, extraText) {
+    const text = (extraText ? extraText + '\n\n' : '') + '🛠 Admin panel:';
+    try {
+      await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...adminMainKeyboard() });
+    } catch (e) {
+      await bot.sendMessage(chatId, text, adminMainKeyboard());
+    }
+  }
+
+  async function handleAdminCallback(chatId, query, data) {
+    const messageId = query.message.message_id;
+
+    // ---- Bosh menyu ----
+    if (data === 'admin_menu') {
+      await backToAdminMenu(chatId, messageId);
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Test qoʻshish (bosqichma-bosqich) ----
+    if (data === 'admin_addtest') {
+      const aSession = getAdminSession(chatId);
+      aSession.state = ADMIN_STATES.ADD_CODE;
+      aSession.data = {};
+      await bot.sendMessage(chatId, '➕ Yangi test.\n\nTest kodini kiriting (masalan: TEST01):');
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Testlar roʻyxati ----
+    if (data === 'admin_listtests') {
+      const rows = await Tests.find({}).sort({ created_at: -1 }).toArray();
+      if (rows.length === 0) {
+        try {
+          await bot.editMessageText('Hozircha testlar yoʻq.', {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: { inline_keyboard: [[{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]] },
+          });
+        } catch (e) {}
+        return bot.answerCallbackQuery(query.id);
+      }
+      const buttons = rows.map((r) => [
+        {
+          text: `${r.is_active ? '✅' : '⛔'} ${r.test_code} (${r.questions_count} savol)`,
+          callback_data: `admin_testcard_${r.test_code}`,
+          style: 'primary',
+        },
+      ]);
+      buttons.push([{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]);
+      try {
+        await bot.editMessageText('📋 Testlar roʻyxati (batafsil koʻrish uchun bosing):', {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: buttons },
+        });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Bitta test kartasi: toggle / statistika ----
+    if (data.startsWith('admin_testcard_')) {
+      const code = data.replace('admin_testcard_', '');
+      const test = await Tests.findOne({ test_code: code });
+      if (!test) {
+        return bot.answerCallbackQuery(query.id, { text: '❌ Test topilmadi.' });
+      }
+      const count = await Submissions.countDocuments({ test_code: code });
+      const lines = [
+        `📘 ${test.test_code} — ${test.title}`,
+        `Holati: ${test.is_active ? '✅ faol' : '⛔ nofaol'}`,
+        `Savollar soni: ${test.questions_count}`,
+        `Vaqt chegarasi: ${test.duration_minutes ? test.duration_minutes + ' daqiqa' : 'yoʻq'}`,
+        `Muddat: ${test.deadline ? formatDateTime(test.deadline) : 'yoʻq'}`,
+        `Topshirganlar soni: ${count}`,
+      ];
+      const buttons = [
+        [
+          { text: test.is_active ? '⛔ Nofaol qilish' : '✅ Faollashtirish', callback_data: `admin_toggletest_${code}`, style: test.is_active ? 'danger' : 'success' },
+          { text: '📊 Statistika', callback_data: `admin_teststats_${code}`, style: 'primary' },
+        ],
+        [{ text: '⬅️ Testlar roʻyxati', callback_data: 'admin_listtests', style: 'primary' }],
+      ];
+      try {
+        await bot.editMessageText(lines.join('\n'), { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: buttons } });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Testni faol/nofaol qilish ----
+    if (data.startsWith('admin_toggletest_')) {
+      const code = data.replace('admin_toggletest_', '');
+      const test = await Tests.findOne({ test_code: code });
+      if (!test) return bot.answerCallbackQuery(query.id, { text: '❌ Test topilmadi.' });
+      const newState = !test.is_active;
+      await Tests.updateOne({ test_code: code }, { $set: { is_active: newState } });
+      await bot.answerCallbackQuery(query.id, { text: newState ? '✅ Faollashtirildi' : '⛔ Nofaol qilindi' });
+      // Kartani yangilab qayta chizamiz
+      return handleAdminCallback(chatId, { message: { message_id: messageId }, id: query.id }, `admin_testcard_${code}`);
+    }
+
+    // ---- Statistika: testlar roʻyxati (tanlash uchun) ----
+    if (data === 'admin_stats') {
+      const rows = await Tests.find({}).sort({ created_at: -1 }).toArray();
+      if (rows.length === 0) {
+        try {
+          await bot.editMessageText('Hozircha testlar yoʻq.', {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: { inline_keyboard: [[{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]] },
+          });
+        } catch (e) {}
+        return bot.answerCallbackQuery(query.id);
+      }
+      const buttons = rows.map((r) => [{ text: `${r.test_code} — ${r.title}`, callback_data: `admin_teststats_${r.test_code}`, style: 'primary' }]);
+      buttons.push([{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]);
+      try {
+        await bot.editMessageText('📊 Qaysi test statistikasini koʻrmoqchisiz?', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: buttons } });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Bitta test uchun statistika (eng ko'p xato qilingan savollar) ----
+    if (data.startsWith('admin_teststats_')) {
+      const code = data.replace('admin_teststats_', '');
+      const result = await computeQuestionStats(code);
+      if (!result) return bot.answerCallbackQuery(query.id, { text: '❌ Test topilmadi.' });
+      const { test, total, stats } = result;
+      let text;
+      if (total === 0) {
+        text = `📊 ${test.test_code} — hali hech kim topshirmagan.`;
+      } else {
+        const top = stats.slice(0, 10).filter((s) => s.wrong > 0);
+        const lines = [`📊 ${test.test_code} — ${total} ta topshirilgan`, '', 'Eng koʻp xato qilingan savollar:'];
+        if (top.length === 0) {
+          lines.push('Hech kim xato qilmagan 🎉');
+        } else {
+          top.forEach((s) => lines.push(`${s.q}-savol: ${s.rate}% xato (${s.wrong}/${s.total})`));
+        }
+        text = lines.join('\n');
+      }
+      const buttons = [[{ text: '⬅️ Orqaga', callback_data: 'admin_stats', style: 'primary' }]];
+      try {
+        await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: buttons } });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Kanallar boshqaruvi ----
+    if (data === 'admin_channels') {
+      const channels = await getChannels();
+      const lines = channels.length ? channels.map((c, i) => `${i + 1}. ${c.id} — ${c.link}`) : ['Hozircha majburiy kanal yoʻq.'];
+      const buttons = channels.map((c) => [{ text: `➖ ${c.id}`, callback_data: `admin_removechannel_${c.id}`, style: 'danger' }]);
+      buttons.push([{ text: '➕ Kanal qoʻshish', callback_data: 'admin_addchannel', style: 'success' }]);
+      buttons.push([{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]);
+      try {
+        await bot.editMessageText(`📡 Majburiy kanallar:\n${lines.join('\n')}`, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: buttons } });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    if (data === 'admin_addchannel') {
+      const aSession = getAdminSession(chatId);
+      aSession.state = ADMIN_STATES.ADD_CHANNEL;
+      aSession.data = {};
+      await bot.sendMessage(chatId, 'Kanalni shu formatda yuboring:\n@kanal_username https://t.me/kanal_username');
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    if (data.startsWith('admin_removechannel_')) {
+      const id = data.replace('admin_removechannel_', '');
+      const channels = await getChannels();
+      const filtered = channels.filter((c) => c.id !== id);
+      await saveChannels(filtered);
+      await bot.answerCallbackQuery(query.id, { text: `✅ ${id} olib tashlandi` });
+      return handleAdminCallback(chatId, { message: { message_id: messageId }, id: query.id }, 'admin_channels');
+    }
+
+    // ---- Foydalanuvchilar ----
+    if (data === 'admin_users') {
+      const count = await Users.countDocuments();
+      const rows = await Users.find({}).sort({ registered_at: -1 }).limit(20).toArray();
+      let text = `👥 Jami roʻyxatdan oʻtganlar: ${count}\n\nOxirgi 20 ta:\n`;
+      text += rows.map((r) => `${r.full_name} — ${r.phone} — ${formatDateTime(r.registered_at)}`).join('\n') || 'Hozircha hech kim yoʻq.';
+      const buttons = [[{ text: '⬅️ Orqaga', callback_data: 'admin_menu', style: 'primary' }]];
+      try {
+        await bot.editMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: buttons } });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Broadcast ----
+    if (data === 'admin_broadcast') {
+      const aSession = getAdminSession(chatId);
+      aSession.state = ADMIN_STATES.BROADCAST;
+      aSession.data = {};
+      await bot.sendMessage(chatId, '📢 Barchaga yuboriladigan xabar matnini kiriting:');
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    if (data === 'admin_broadcast_send') {
+      const aSession = getAdminSession(chatId);
+      const text = aSession.data.broadcastText;
+      resetAdminSession(chatId);
+      if (!text) return bot.answerCallbackQuery(query.id, { text: '❌ Xabar topilmadi.' });
+      const users = await Users.find({}).toArray();
+      let sent = 0;
+      for (const u of users) {
+        try {
+          await bot.sendMessage(u.user_id, `📢 ${text}`);
+          sent++;
+        } catch (e) {}
+      }
+      try {
+        await bot.editMessageText(`✅ Xabar ${sent}/${users.length} foydalanuvchiga yuborildi.`, { chat_id: chatId, message_id: messageId });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    if (data === 'admin_broadcast_cancel') {
+      resetAdminSession(chatId);
+      try {
+        await bot.editMessageText('❌ Bekor qilindi.', { chat_id: chatId, message_id: messageId });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    // ---- Export ----
+    if (data === 'admin_export') {
+      await bot.answerCallbackQuery(query.id, { text: 'Tayyorlanmoqda...' });
+      const submissions = await Submissions.find({}).sort({ submitted_at: -1 }).toArray();
+      if (submissions.length === 0) return bot.sendMessage(chatId, 'Eksport qilish uchun maʼlumot yoʻq.');
+      const userIds = [...new Set(submissions.map((s) => s.user_id))];
+      const users = await Users.find({ user_id: { $in: userIds } }).toArray();
+      const userMap = new Map(users.map((u) => [u.user_id, u]));
+      const header = 'Ism Familiya,Telefon,Test kodi,Toʻgʻri javob,Foiz,Sana\n';
+      const body = submissions
+        .map((s) => {
+          const u = userMap.get(s.user_id) || {};
+          return `"${u.full_name || ''}","${u.phone || ''}","${s.test_code}",${s.correct_count},${s.percentage},"${new Date(s.submitted_at).toISOString()}"`;
+        })
+        .join('\n');
+      const csv = header + body;
+      const filePath = path.join(__dirname, 'export.csv');
+      fs.writeFileSync(filePath, csv, 'utf8');
+      bot.sendDocument(chatId, filePath).finally(() => {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (e) {}
+      });
+      return;
+    }
+
+    // ---- Reytingni tozalash (tasdiqlash bilan) ----
+    if (data === 'admin_resetrating') {
+      const buttons = [
+        [
+          { text: '⚠️ Ha, tozalash', callback_data: 'admin_resetrating_confirm', style: 'danger' },
+          { text: '❌ Bekor qilish', callback_data: 'admin_menu', style: 'primary' },
+        ],
+      ];
+      try {
+        await bot.editMessageText('♻️ Haqiqatan ham barcha natijalarni oʻchirmoqchimisiz? Bu amalni ortga qaytarib boʻlmaydi.', {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: buttons },
+        });
+      } catch (e) {}
+      return bot.answerCallbackQuery(query.id);
+    }
+
+    if (data === 'admin_resetrating_confirm') {
+      await Submissions.deleteMany({});
+      await bot.answerCallbackQuery(query.id, { text: '✅ Tozalandi' });
+      return backToAdminMenu(chatId, messageId, '✅ Reyting va barcha natijalar tozalandi.');
+    }
+
+    return bot.answerCallbackQuery(query.id);
+  }
+
+  // Admin FSM: matnli xabarlarni qayta ishlash (test qoʻshish bosqichlari, kanal, broadcast)
+  async function handleAdminFsmMessage(chatId, aSession, text) {
+    switch (aSession.state) {
+      case ADMIN_STATES.ADD_CODE: {
+        if (!text) return bot.sendMessage(chatId, 'Test kodini kiriting:');
+        aSession.data.code = text.toUpperCase();
+        aSession.state = ADMIN_STATES.ADD_TITLE;
+        return bot.sendMessage(chatId, 'Test nomini kiriting (masalan: 1-mavzu testi):');
+      }
+      case ADMIN_STATES.ADD_TITLE: {
+        if (!text) return bot.sendMessage(chatId, 'Test nomini kiriting:');
+        aSession.data.title = text;
+        aSession.state = ADMIN_STATES.ADD_KEY;
+        return bot.sendMessage(chatId, "Toʻgʻri javoblar kalitini kiriting (masalan: A*B*C*D*A*B*C*D*A*B):");
+      }
+      case ADMIN_STATES.ADD_KEY: {
+        const key = normalizeAnswers(text || '');
+        if (key.length === 0) {
+          return bot.sendMessage(chatId, '❌ Javoblar kaliti boʻsh boʻlmasligi kerak. Qaytadan kiriting:');
+        }
+        aSession.data.keyRaw = text;
+        aSession.state = ADMIN_STATES.ADD_DURATION;
+        return bot.sendMessage(chatId, "⏱ Vaqt chegarasi (daqiqada) kiriting. Kerak boʻlmasa 0 yozing:");
+      }
+      case ADMIN_STATES.ADD_DURATION: {
+        const n = parseInt(text, 10);
+        if (isNaN(n) || n < 0) {
+          return bot.sendMessage(chatId, "❌ Butun son kiriting (masalan: 30), kerak boʻlmasa 0:");
+        }
+        aSession.data.duration = n > 0 ? n : null;
+        aSession.state = ADMIN_STATES.ADD_DEADLINE;
+        return bot.sendMessage(chatId, "📅 Test muddatini kiriting (format: YYYY-MM-DD HH:MM). Kerak boʻlmasa 0 yozing:");
+      }
+      case ADMIN_STATES.ADD_DEADLINE: {
+        const parsed = parseDeadlineInput(text || '0');
+        if (!parsed.skip && !parsed.valid) {
+          return bot.sendMessage(chatId, "❌ Format notoʻgʻri. Masalan: 2026-09-01 18:00, yoki kerak boʻlmasa 0:");
+        }
+        const deadlineDate = parsed.skip ? null : parsed.date;
+        const { code, title, keyRaw, duration } = aSession.data;
+        const result = await upsertTest(code, title, keyRaw, duration, deadlineDate);
+        resetAdminSession(chatId);
+        if (!result.ok) {
+          return bot.sendMessage(chatId, '❌ Xatolik yuz berdi, qaytadan urinib koʻring.');
+        }
+        const lines = [
+          `✅ Test saqlandi: ${result.code} (${result.questionsCount} ta savol)`,
+          duration ? `⏱ Vaqt chegarasi: ${duration} daqiqa` : '⏱ Vaqt chegarasi: yoʻq',
+          deadlineDate ? `📅 Muddat: ${formatDateTime(deadlineDate)}` : '📅 Muddat: yoʻq',
+        ];
+        return bot.sendMessage(chatId, lines.join('\n'), adminMainKeyboard());
+      }
+      case ADMIN_STATES.ADD_CHANNEL: {
+        const m = (text || '').match(/^(\S+)\s+(\S+)$/);
+        if (!m) {
+          return bot.sendMessage(chatId, 'Format notoʻgʻri. Masalan: @kanal https://t.me/kanal');
+        }
+        const [, id, link] = m;
+        const channels = await getChannels();
+        if (channels.some((c) => c.id === id)) {
+          resetAdminSession(chatId);
+          return bot.sendMessage(chatId, `ℹ️ ${id} allaqachon roʻyxatda bor.`, adminMainKeyboard());
+        }
+        channels.push({ id, link });
+        await saveChannels(channels);
+        resetAdminSession(chatId);
+        return bot.sendMessage(chatId, `✅ Kanal qoʻshildi: ${id}\nJami majburiy kanallar: ${channels.length}`, adminMainKeyboard());
+      }
+      case ADMIN_STATES.BROADCAST: {
+        if (!text) return bot.sendMessage(chatId, 'Xabar matnini kiriting:');
+        aSession.data.broadcastText = text;
+        const buttons = [
+          [
+            { text: '✅ Yuborish', callback_data: 'admin_broadcast_send', style: 'success' },
+            { text: '❌ Bekor qilish', callback_data: 'admin_broadcast_cancel', style: 'danger' },
+          ],
+        ];
+        return bot.sendMessage(chatId, `Quyidagi xabar barcha foydalanuvchilarga yuboriladi:\n\n📢 ${text}`, {
+          reply_markup: { inline_keyboard: buttons },
+        });
+      }
+      default:
+        resetAdminSession(chatId);
+        return;
+    }
+  }
+
+  // =====================================================================
+  // LEGACY ADMIN BUYRUQLARI (matn orqali, /admin panel bilan bir xil funksiyalardan foydalanadi)
+  // =====================================================================
+
+  // /addtest KOD|Nomi|JAVOBLAR|[DAQIQA]|[YYYY-MM-DD HH:MM]
   bot.onText(/^\/addtest ([\s\S]+)/, async (msg, match) => {
     if (!requireAdmin(msg)) return;
     const parts = match[1].split('|').map((p) => p.trim());
     if (parts.length < 3) {
       return bot.sendMessage(
         msg.chat.id,
-        'Format: /addtest TEST_KODI|Test nomi|TOʻGʻRI_JAVOBLAR\nMasalan: /addtest TEST01|1-mavzu|A*B*C*D*A*B*C*D*A*B'
+        'Format: /addtest TEST_KODI|Test nomi|TOʻGʻRI_JAVOBLAR|[daqiqa]|[YYYY-MM-DD HH:MM]\nMasalan: /addtest TEST01|1-mavzu|A*B*C*D*A*B*C*D*A*B|30'
       );
     }
-    const [code, title, keyRaw] = parts;
-    const key = normalizeAnswers(keyRaw);
-    if (key.length === 0) {
+    const [code, title, keyRaw, durationRaw, deadlineRaw] = parts;
+    const duration = durationRaw ? parseInt(durationRaw, 10) || null : null;
+    let deadlineDate = null;
+    if (deadlineRaw) {
+      const parsed = parseDeadlineInput(deadlineRaw);
+      if (parsed.valid) deadlineDate = parsed.date;
+    }
+    const result = await upsertTest(code, title, keyRaw, duration, deadlineDate);
+    if (!result.ok) {
       return bot.sendMessage(msg.chat.id, '❌ Javoblar kaliti boʻsh boʻlmasligi kerak.');
     }
-    const testCode = code.toUpperCase();
-    await Tests.updateOne(
-      { test_code: testCode },
-      {
-        $set: {
-          test_code: testCode,
-          title,
-          answer_key: key.join('*'),
-          questions_count: key.length,
-          is_active: true,
-        },
-        $setOnInsert: { created_at: new Date() },
-      },
-      { upsert: true }
-    );
-    bot.sendMessage(msg.chat.id, `✅ Test saqlandi: ${testCode} (${key.length} ta savol).`);
+    bot.sendMessage(msg.chat.id, `✅ Test saqlandi: ${result.code} (${result.questionsCount} ta savol).`);
   });
 
   // /toggletest TEST01
@@ -625,21 +1175,19 @@ function registerHandlers() {
       try {
         await bot.sendMessage(u.user_id, `📢 ${text}`);
         sent++;
-      } catch (e) {
-        // foydalanuvchi botni bloklagan boʻlishi mumkin
-      }
+      } catch (e) {}
     }
     bot.sendMessage(msg.chat.id, `✅ Xabar ${sent}/${users.length} foydalanuvchiga yuborildi.`);
   });
 
-  // /admin - admin buyruqlar roʻyxati
-  bot.onText(/^\/admin$/, (msg) => {
+  // /adminhelp - matnli buyruqlar roʻyxati (legacy, /admin panel tavsiya etiladi)
+  bot.onText(/^\/adminhelp$/, (msg) => {
     if (!requireAdmin(msg)) return;
     bot.sendMessage(
       msg.chat.id,
       [
-        'Admin buyruqlari:',
-        '/addtest KOD|Nomi|JAVOBLAR — test qoʻshish/tahrirlash',
+        'Admin buyruqlari (matn orqali, /admin panel ham mavjud):',
+        '/addtest KOD|Nomi|JAVOBLAR|[daqiqa]|[YYYY-MM-DD HH:MM]',
         '/toggletest KOD — testni faol/nofaol qilish',
         '/listtests — barcha testlar',
         '/addchannel @kanal https://t.me/kanal — majburiy kanal qoʻshish',
@@ -702,12 +1250,26 @@ async function handleMyResults(chatId, userId) {
 }
 
 const PAGE_SIZE = 10;
+const RATING_PERIODS = {
+  all: { label: '🏆 Umumiy', days: null },
+  week: { label: '📅 Hafta', days: 7 },
+  month: { label: '🗓 Oy', days: 30 },
+};
 
-async function buildRatingText(page, userId) {
-  const all = await Submissions.aggregate([
-    { $group: { _id: '$user_id', total: { $sum: '$correct_count' } } },
-    { $sort: { total: -1 } },
-  ]).toArray();
+function periodCutoff(period) {
+  const cfg = RATING_PERIODS[period] || RATING_PERIODS.all;
+  if (!cfg.days) return null;
+  return new Date(Date.now() - cfg.days * 24 * 60 * 60 * 1000);
+}
+
+async function buildRatingText(page, userId, period) {
+  const cutoff = periodCutoff(period);
+  const pipeline = [];
+  if (cutoff) pipeline.push({ $match: { submitted_at: { $gte: cutoff } } });
+  pipeline.push({ $group: { _id: '$user_id', total: { $sum: '$correct_count' } } });
+  pipeline.push({ $sort: { total: -1 } });
+
+  const all = await Submissions.aggregate(pipeline).toArray();
 
   const userIds = all.map((r) => r._id);
   const users = await Users.find({ user_id: { $in: userIds } }).toArray();
@@ -716,7 +1278,8 @@ async function buildRatingText(page, userId) {
   const start = page * PAGE_SIZE;
   const pageRows = all.slice(start, start + PAGE_SIZE);
 
-  let text = '🏆 UMUMIY REYTING\n\n';
+  const periodLabel = (RATING_PERIODS[period] || RATING_PERIODS.all).label;
+  let text = `🏆 REYTING — ${periodLabel}\n\n`;
   if (pageRows.length === 0) {
     text += 'Hozircha hech kim test topshirmagan.';
   } else {
@@ -740,16 +1303,66 @@ async function buildRatingText(page, userId) {
   return { text, totalPages };
 }
 
-function ratingKeyboard(page, totalPages) {
-  const buttons = [];
-  if (page > 0) buttons.push({ text: '◀️ Oldingi', callback_data: `rating_${page - 1}`, style: 'primary' });
-  if (page < totalPages - 1) buttons.push({ text: 'Keyingi ▶️', callback_data: `rating_${page + 1}`, style: 'primary' });
-  return buttons.length ? { reply_markup: { inline_keyboard: [buttons] } } : {};
+function ratingKeyboard(page, totalPages, period) {
+  const periodRow = Object.keys(RATING_PERIODS).map((key) => ({
+    text: (key === period ? '✅ ' : '') + RATING_PERIODS[key].label,
+    callback_data: `rating_${key}_0`,
+    style: key === period ? 'success' : 'primary',
+  }));
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: '◀️ Oldingi', callback_data: `rating_${period}_${page - 1}`, style: 'primary' });
+  if (page < totalPages - 1) navRow.push({ text: 'Keyingi ▶️', callback_data: `rating_${period}_${page + 1}`, style: 'primary' });
+
+  const inline_keyboard = [periodRow];
+  if (navRow.length) inline_keyboard.push(navRow);
+  return { reply_markup: { inline_keyboard } };
 }
 
-async function handleRating(chatId, userId, page) {
-  const { text, totalPages } = await buildRatingText(page, userId);
-  return bot.sendMessage(chatId, text, ratingKeyboard(page, totalPages));
+async function handleRating(chatId, userId, page, period) {
+  const { text, totalPages } = await buildRatingText(page, userId, period);
+  return bot.sendMessage(chatId, text, ratingKeyboard(page, totalPages, period));
+}
+
+// ---------- ESLATMA TIZIMI ----------
+// Muddati belgilangan testlar uchun, muddat tugashiga REMINDER_WINDOW_HOURS soat qolganda
+// hali topshirmagan foydalanuvchilarga bir martalik eslatma yuboradi.
+const REMINDER_CHECK_INTERVAL_MS = 30 * 60 * 1000; // har 30 daqiqada tekshiradi
+const REMINDER_WINDOW_HOURS = 24;
+
+function startReminderScheduler() {
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const windowEnd = new Date(now.getTime() + REMINDER_WINDOW_HOURS * 60 * 60 * 1000);
+      const tests = await Tests.find({
+        is_active: true,
+        deadline: { $ne: null, $gte: now, $lte: windowEnd },
+        reminder_sent: { $ne: true },
+      }).toArray();
+
+      for (const test of tests) {
+        const submitted = await Submissions.find({ test_code: test.test_code }).toArray();
+        const submittedIds = new Set(submitted.map((s) => s.user_id));
+        const users = await Users.find({ is_active: true }).toArray();
+        const targets = users.filter((u) => !submittedIds.has(u.user_id));
+
+        for (const u of targets) {
+          try {
+            await bot.sendMessage(
+              u.user_id,
+              `⏰ Eslatma: "${test.title}" (${test.test_code}) testini topshirish muddati tez orada tugaydi!\nOxirgi muddat: ${formatDateTime(test.deadline)}`
+            );
+          } catch (e) {
+            // foydalanuvchi botni bloklagan boʻlishi mumkin
+          }
+        }
+        await Tests.updateOne({ test_code: test.test_code }, { $set: { reminder_sent: true } });
+      }
+    } catch (err) {
+      console.error('Eslatma tizimi xatosi:', err);
+    }
+  }, REMINDER_CHECK_INTERVAL_MS);
 }
 
 // ---------- ISHGA TUSHIRISH ----------
