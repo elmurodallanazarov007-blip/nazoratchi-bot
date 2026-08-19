@@ -127,15 +127,18 @@ function resetSession(chatId) {
 const mainMenu = {
   reply_markup: {
     keyboard: [
-      ['📝 Vazifani yuborish'],
-      ['📊 Mening natijalarim', '🏆 Reyting'],
+      [{ text: '📝 Vazifani yuborish', style: 'primary' }],
+      [
+        { text: '📊 Mening natijalarim', style: 'primary' },
+        { text: '🏆 Reyting', style: 'primary' },
+      ],
     ],
     resize_keyboard: true,
   },
 };
 const contactKeyboard = {
   reply_markup: {
-    keyboard: [[{ text: '📱 Raqamni yuborish', request_contact: true }]],
+    keyboard: [[{ text: '📱 Raqamni yuborish', request_contact: true, style: 'success' }]],
     resize_keyboard: true,
     one_time_keyboard: true,
   },
@@ -193,9 +196,9 @@ function notMemberMessage(missing) {
 // standart koʻrinish shaffof boʻladi) URL-tugma, pastda esa koʻk (primary) "Tekshirish" tugmasi.
 function notMemberKeyboard(missing) {
   const rows = missing.map((ch) => [
-    { text: `🔗 ${ch.id.replace('@', '')}`, url: ch.link },
+    { text: `🔗 ${ch.id.replace('@', '')}`, url: ch.link, style: 'primary' },
   ]);
-  rows.push([{ text: '✅ Tekshirish', callback_data: 'check_membership', style: 'primary' }]);
+  rows.push([{ text: '✅ Tekshirish', callback_data: 'check_membership', style: 'success' }]);
   return { reply_markup: { inline_keyboard: rows } };
 }
 
@@ -739,8 +742,8 @@ async function buildRatingText(page, userId) {
 
 function ratingKeyboard(page, totalPages) {
   const buttons = [];
-  if (page > 0) buttons.push({ text: '◀️ Oldingi', callback_data: `rating_${page - 1}` });
-  if (page < totalPages - 1) buttons.push({ text: 'Keyingi ▶️', callback_data: `rating_${page + 1}` });
+  if (page > 0) buttons.push({ text: '◀️ Oldingi', callback_data: `rating_${page - 1}`, style: 'primary' });
+  if (page < totalPages - 1) buttons.push({ text: 'Keyingi ▶️', callback_data: `rating_${page + 1}`, style: 'primary' });
   return buttons.length ? { reply_markup: { inline_keyboard: [buttons] } } : {};
 }
 
