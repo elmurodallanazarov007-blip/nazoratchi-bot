@@ -172,8 +172,17 @@ async function checkMembership(userId) {
 }
 
 function notMemberMessage(missing) {
-  const lines = missing.map((ch) => `🔗 ${ch.link}`).join('\n');
-  return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling:\n\n${lines}\n\nAʼzo boʻlgach, qaytadan /start bosing.`;
+  return `❌ Siz barcha majburiy kanallarga aʼzo emassiz.\nQuyidagi kanal(lar)ga aʼzo boʻling, keyin "✅ Tekshirish" tugmasini bosing:`;
+}
+
+// Har bir kanal uchun shaffof (style berilmagan — Bot API 9.4'da inline tugmalar uchun
+// standart koʻrinish shaffof boʻladi) URL-tugma, pastda esa koʻk (primary) "Tekshirish" tugmasi.
+function notMemberKeyboard(missing) {
+  const rows = missing.map((ch) => [
+    { text: `🔗 ${ch.id.replace('@', '')}`, url: ch.link },
+  ]);
+  rows.push([{ text: '✅ Tekshirish', callback_data: 'check_membership', style: 'primary' }]);
+  return { reply_markup: { inline_keyboard: rows } };
 }
 
 function normalizeAnswers(raw) {
@@ -254,7 +263,7 @@ function registerHandlers() {
 
     const membership = await checkMembership(userId);
     if (!membership.ok) {
-      return bot.sendMessage(chatId, notMemberMessage(membership.missing));
+      return bot.sendMessage(chatId, notMemberMessage(membership.missing), notMemberKeyboard(membership.missing));
     }
 
     const user = await getUser(userId);
@@ -344,7 +353,7 @@ function registerHandlers() {
         const membership = await checkMembership(userId);
         if (!membership.ok) {
           resetSession(chatId);
-          return bot.sendMessage(chatId, notMemberMessage(membership.missing));
+          return bot.sendMessage(chatId, notMemberMessage(membership.missing), notMemberKeyboard(membership.missing));
         }
 
         const test = await Tests.findOne({ test_code: session.data.test_code });
@@ -397,6 +406,31 @@ function registerHandlers() {
   bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const userId = query.from.id;
+
+    if (query.data === 'check_membership') {
+      const membership = await checkMembership(userId);
+      if (membership.ok) {
+        try {
+          await bot.editMessageText('✅ Aʼzolik tasdiqlandi! Davom etish uchun /start bosing.', {
+            chat_id: chatId,
+            message_id: query.message.message_id,
+          });
+        } catch (e) {}
+        await bot.answerCallbackQuery(query.id, { text: '✅ Barcha kanallarga aʼzosiz!' });
+        return;
+      }
+      try {
+        await bot.editMessageText(notMemberMessage(membership.missing), {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          ...notMemberKeyboard(membership.missing),
+        });
+      } catch (e) {
+        // xabar oʻzgarmagan boʻlishi mumkin (hali ham xuddi shu kanallarga aʼzo emas)
+      }
+      return bot.answerCallbackQuery(query.id, { text: '❌ Hali barcha kanallarga aʼzo emassiz.' });
+    }
+
     if (query.data && query.data.startsWith('rating_')) {
       const page = parseInt(query.data.split('_')[1], 10) || 0;
       const { text, totalPages } = await buildRatingText(page, userId);
@@ -607,7 +641,7 @@ async function handleAskForTestCode(chatId, userId) {
   const membership = await checkMembership(userId);
   if (!membership.ok) {
     resetSession(chatId);
-    return bot.sendMessage(chatId, notMemberMessage(membership.missing));
+    return bot.sendMessage(chatId, notMemberMessage(membership.missing), notMemberKeyboard(membership.missing));
   }
   const user = await getUser(userId);
   if (!user) {
